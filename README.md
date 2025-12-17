@@ -1,79 +1,170 @@
 # AutoShutdown（Windows 原生托盘版）
 
-一个纯 Python（标准库）实现的 Windows 托盘常驻小工具：在满足“电脑已运行时间 + 空闲时间”阈值后，根据联网情况选择 **发送群组微信通知** 或 **弹出可取消的休眠倒计时**。
+一个 **纯 Python（仅标准库）** 实现的 Windows 托盘常驻工具：  
+当满足 **电脑运行时间 + 用户空闲时间** 条件后，根据 **联网状态与策略**，自动 **发送群组微信通知**，并可 **进入可取消的休眠流程**。
 
-> 项目核心逻辑：定时检测 **开机运行时长**（GetTickCount64）与 **用户空闲时长**（GetLastInputInfo），满足阈值且超过冷却时间后触发通知/休眠流程。
+本项目不依赖第三方 GUI 框架，完全基于 **Win32 API（ctypes）** 实现，适合追求轻量、可控与可打包分发的场景。
 
 ---
 
+
 ## 主要功能
 
-### 1) 托盘常驻 + 右键菜单
+### 1️⃣ 托盘常驻 + 右键菜单
 
-- 运行后不显示主窗口，托盘图标常驻；右键弹出菜单，双击打开“设置”。
-- 菜单项（部分）：
-  - **本次不提醒**（仅影响下一次触发）
-  - **本次不关机**（仅影响下一次触发）
-  - **开机自启**
-  - **设置...**
-  - **恢复默认（取消本次抑制）**
-  - **退出**
+- 程序启动后 **无主窗口**，仅在系统托盘显示图标  
+- **右键菜单** 支持：
+  - 本次不提醒（仅对下一次生效）
+  - 本次不关机（仅对下一次生效）
+  - 开机自启（带完整性校验）
+  - 设置...
+  - 关于...
+  - 恢复默认提醒/休眠设置
+  - 退出
+- **双击托盘图标**：打开设置窗口
 
-### 2) 触发条件与冷却时间
+---
 
-- 触发条件同时满足：
-  - 电脑运行时间 ≥ `uptime_hours`
-  - 用户空闲时间 ≥ `idle_minutes`
-  - 距上次触发 ≥ `cooldown_minutes`（防刷屏/反复休眠）fileciteturn4file0L30-L45
+### 2️⃣ 触发条件与冷却机制
 
-### 3) 联网时：发送群组微信通知（pushplus）
+触发需 **同时满足**：
 
-- 两级联网判断：
-  1. WinAPI：`InternetGetConnectedState`
-  2. DNS 解析 + 轻量 HTTP GET（可配置 URL 与超时）
-- 在线且发送成功：弹托盘提示“已发送群组微信通知”。
+- 开机运行时间 ≥ `uptime_hours`
+- 用户空闲时间 ≥ `idle_minutes`
+- 距离上次触发 ≥ `cooldown_minutes`（防刷屏 / 防反复休眠）
 
-### 4) 离线/发送失败：弹出可取消休眠倒计时
+---
 
-- 无网络或发送失败时，弹出置顶倒计时窗口（默认 60 秒，可配置），可“取消本次休眠”或“立即休眠”。
-- 倒计时结束或点击“立即休眠”后调用 `shutdown /h` 进入休眠。
+### 3️⃣ 联网判断（两级校验）
 
-### 5) 设置窗口
+1. **WinAPI**：`InternetGetConnectedState`
+2. **二级校验**：  
+   - DNS 解析  
+   - 轻量 HTTP GET（URL 与超时可配置）
 
-- 支持配置阈值/周期：`uptime_hours`、`idle_minutes`、`check_interval_sec`、`cooldown_minutes`、`pre_hibernate_countdown_sec` 等。
-- 支持“测试消息发送”“测试休眠”。
-- 支持检查/开启休眠（`powercfg /a`、`powercfg /h on`），并把 `powercfg /a` 结果写入 `%APPDATA%\AutoShutdown\powercfg_a.txt` 便于排查。
+---
 
-### 6) 开机自启：Startup 目录快捷方式 + 完整性检查
+### 4️⃣ 联网状态下的行为（可配置）
 
-- 使用 **Startup 文件夹 .lnk 快捷方式**实现自启，目标路径规则：
-  - 打包 EXE：`程序当前路径 + 程序名称`（WinAPI 获取当前进程 exe 完整路径）
-  - 脚本运行：`pythonw.exe "脚本路径"`fileciteturn1file3L1-L23
-- 每次启动时做 **快捷方式存在性与路径一致性**检查：
-  - 若缺失/被篡改，优先自动修复；自动修复失败再提示用户“修复/关闭/忽略”。
+当检测到联网且消息发送成功时，支持三种策略：
 
-### 7) 配置与日志
+| 策略           | 行为                        |
+| -------------- | --------------------------- |
+| 仅提醒         | 发送群组微信通知，不休眠    |
+| 提醒后休眠     | 发送通知后弹出休眠倒计时    |
+| 两次提醒后休眠 | 第 2 次触发时才进入休眠流程 |
 
-- 配置文件：`%APPDATA%\AutoShutdown\config.json`（首次运行自动创建；支持从旧目录迁移）。
-- 错误日志：`%APPDATA%\AutoShutdown\error.log`。
-- 单实例：使用 Mutex `Local\AutoShutdownReminder_SingleInstance` 防止重复运行。
+---
+
+### 5️⃣ 离线 / 发送失败：可取消休眠倒计时
+
+- 无网络或发送失败 → **弹出置顶倒计时窗口**
+
+- 默认 60 秒（可配置）：
+
+  - 取消本次休眠
+  - 立即休眠
+
+- 倒计时结束自动执行：  
+
+  ```
+  shutdown /h
+  ```
+
+---
+
+### 6️⃣ 设置窗口（原生 Win32）
+
+支持配置：
+
+- pushplus Token / Topic / API
+- 开机运行时长阈值（小时）
+- 空闲时间阈值（分钟）
+- 检查周期（秒）
+- 冷却时间（分钟）
+- 休眠倒计时（秒）
+- 二级网络校验 URL / 超时
+- **联网提醒后休眠策略**
+- **自定义提醒内容模板**（支持 `{base_info}`）
+
+附带功能：
+
+- 测试消息发送
+- 测试休眠（60 秒可取消）
+- 休眠可用性检查（`powercfg /a`）
+- 一键开启休眠（必要时自动 UAC 提权）
+
+---
+
+### 7️⃣ 自定义提醒内容
+
+提醒内容支持模板，占位符：
+
+- `{base_info}` 自动展开为：
+  - 电脑已运行时间
+  - 空闲时间
+  - 当前时间
+
+示例：
+
+```
+{base_info}
+
+建议：确认是否需要关机、休眠或合盖。
+```
+
+---
+
+### 8️⃣ 开机自启（稳健实现）
+
+- 使用 **Startup 目录 .lnk 快捷方式**
+- **WinAPI 获取当前运行 EXE 路径**（避免 8.3 短路径问题）
+- 每次启动自动执行：
+  - 快捷方式存在性检查
+  - 目标路径 / 参数一致性校验
+- 异常时弹出三选一对话框：
+  - 修复
+  - 关闭自启
+  - 忽略
+
+> 已自动清理旧版 Registry Run 自启方式，避免冲突
+
+---
+
+### 9️⃣ 配置与日志
+
+- 配置文件：  
+
+  ```
+  %APPDATA%\AutoShutdown\config.json
+  ```
+
+- 错误日志：  
+
+  ```
+  %APPDATA%\AutoShutdown\error.log
+  ```
+
+- 自动迁移旧版本配置文件
+
+- 单实例运行（Win32 Mutex）
 
 ---
 
 ## 快速开始
 
-### 运行程序
+### 方式一：直接运行（Release）
 
-前往release中下载安装程序，安装到电脑中后运行。
+前往 GitHub Releases 下载已打包版本，解压后运行 EXE。
 
-### 运行脚本（开发/调试）
+### 方式二：脚本运行（开发 / 调试）
 
-1. 准备环境：Windows 10/11 + Python 3.x（推荐 3.10+）。
+1. Windows 10 / 11 + Python 3.10+
 
 2. 同目录放置：
 
    - `auto_shutdown_win32_native.py`
-   - `AutoShutdown.ico`（可选，没有也能运行）
+   - `AutoShutdown.ico`（可选）
 
 3. 启动：
 
@@ -81,19 +172,17 @@
    python auto_shutdown_win32_native.py
    ```
 
-4. 运行后在系统托盘找到 **AutoShutdown** 图标，右键进入“设置”。
-
 ---
 
-## 配置项说明（config.json）
-
-默认配置如下（示意）：
+## 配置文件示例（config.json）
 
 ```json
 {
   "pushplus_token": "",
   "pushplus_topic": "",
   "pushplus_api": "https://www.pushplus.plus/send",
+  "remind_template": "{base_info}\n\n建议：确认是否需要关机或休眠。",
+  "online_hibernate_policy": 0,
   "uptime_hours": 2,
   "idle_minutes": 60,
   "check_interval_sec": 120,
@@ -105,32 +194,9 @@
 }
 ```
 
-字段含义：
-
-- `pushplus_token` / `pushplus_topic`：pushplus 群组推送参数（在线且推送成功时走通知路径）。
-- `uptime_hours`：开机运行时长阈值（小时）
-- `idle_minutes`：空闲阈值（分钟）
-- `check_interval_sec`：检测周期（秒，最低 10 秒）
-- `cooldown_minutes`：触发冷却时间（分钟）
-- `pre_hibernate_countdown_sec`：离线/发送失败时，休眠倒计时（秒）
-- `net_check_url` / `net_check_timeout_sec`：二级联网检测 URL 与超时（秒）
-- `autostart_enabled`：是否启用开机自启（由托盘菜单控制保存）。
-
 ---
 
-## 打包指南（Nuitka）
-
-> 目标：生成可直接分发的 Windows GUI 程序（无控制台窗口），并把图标资源一起带上。
-
-### 1) 安装 Nuitka
-
-```bash
-python -m pip install -U nuitka
-```
-
-### 2) 推荐打包命令（standalone）
-
-在项目根目录执行（按你的文件名调整）：
+## 打包指南（Nuitka，推荐）
 
 ```powershell
 python -m nuitka .\auto_shutdown_win32_native.py `
@@ -141,47 +207,19 @@ python -m nuitka .\auto_shutdown_win32_native.py `
   --output-dir=diststand
 ```
 
-说明：
-
-- `--standalone`：输出包含运行依赖（适合直接分发）
-- `--windows-console-mode=disable`：不弹控制台黑窗
-- `--include-data-files`：把 `AutoShutdown.ico` 复制到输出目录，确保托盘图标正常加载
-
-打包完成后，在 `diststand\auto_shutdown_win32_native.dist\` 目录中找到 exe 并运行。
-
-### 3) “仍出现黑窗”的常见原因
-
-- 不是主程序控制台，而是 **子进程**（例如 `powercfg`、`shutdown`、`powershell`）弹窗。
-  - 本项目已对这些命令优先采用隐藏方式启动（子进程默认不应弹黑窗）。
-- 若你的环境仍异常：优先查看 `%APPDATA%\AutoShutdown\error.log` 排查调用失败原因。fileciteturn3file2L20-L29
+- 不弹控制台黑窗
+- 子进程统一使用隐藏方式启动（`CREATE_NO_WINDOW`）
 
 ---
 
-##（可选）制作安装包
+## 项目信息
 
-如果你需要“选择安装目录 → 解压/复制文件 → 创建桌面快捷方式 → 安装完成后运行”，可考虑：
-
-- Inno Setup
-- NSIS
-
-这些工具适合把 `*.dist` 整个目录作为安装内容进行打包。
+- 项目名称：AutoShutdown
+- 当前版本：0.0.2
+- GitHub： https://github.com/xjhaz/AutoShutdown
 
 ---
 
-## 常见问题（FAQ）
+## License
 
-### 1) 为什么不休眠？
-
-- 请先在“设置”里点击“休眠可用性检查（powercfg /a）”，确认 Hibernate 可用；必要时点击“开启休眠（powercfg /h on）”。
-
-### 2) 开机自启为什么失效？
-
-- 本项目使用 Startup 目录快捷方式，并在每次启动做完整性检查；若被删除/篡改会尝试自动修复，不行再提示你选择处理方式。
-
----
-
-## TODO
-
-- 自定义发送消息内容（目前通知文本为固定模板）。
-- 添加“关于/版本信息”窗口（或菜单项）。
-- 提供选项：在联网状态下 **通知发送成功后仍进入休眠**（当前逻辑是：在线且发送成功则仅通知，不休眠；离线/发送失败才休眠）。
+MIT License

@@ -155,7 +155,7 @@
 
 ### 方式一：直接运行（Release）
 
-前往 GitHub Releases 下载已打包版本，解压后运行 EXE。
+前往 GitHub Releases 下载已打包版本，安装后运行。
 
 ### 方式二：脚本运行（开发 / 调试）
 

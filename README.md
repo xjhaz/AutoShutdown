@@ -1,5 +1,4 @@
-# AutoShutdown（Windows 原生托盘版）
-
+# AutoShutdown
 一个纯 Python（标准库）实现的 Windows 托盘常驻小工具：在满足“电脑已运行时间 + 空闲时间”阈值后，根据联网情况选择 **发送群组微信通知** 或 **弹出可取消的休眠倒计时**。
 
 > 项目核心逻辑：定时检测 **开机运行时长**（GetTickCount64）与 **用户空闲时长**（GetLastInputInfo），满足阈值且超过冷却时间后触发通知/休眠流程。

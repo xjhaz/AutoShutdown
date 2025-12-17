@@ -12,32 +12,9 @@ from ctypes import wintypes
 from datetime import datetime, timedelta
 from urllib import request as urlrequest
 
-# -----------------------------
-# Subprocess helpers (hide console windows for child console apps)
-# -----------------------------
-def _run_subprocess_hidden(args, **kwargs):
-    """Run subprocess without showing a console window (Windows)."""
-    if os.name == "nt":
-        # CREATE_NO_WINDOW avoids a new console window for console programs (e.g., powershell/powercfg).
-        creationflags = int(kwargs.pop("creationflags", 0)) | int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
-        kwargs["creationflags"] = creationflags
-
-        # Also request hidden window style for additional robustness.
-        try:
-            si = kwargs.pop("startupinfo", None)
-            if si is None:
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= int(getattr(subprocess, "STARTF_USESHOWWINDOW", 1))
-                si.wShowWindow = 0  # SW_HIDE
-            kwargs["startupinfo"] = si
-        except Exception:
-            pass
-
-        # Avoid opening a shell (which may spawn cmd.exe).
-        kwargs.setdefault("shell", False)
-
-    return subprocess.run(args, **kwargs)
-
+APP_NAME = "AutoShutdown"
+APP_VERSION = "0.0.2"
+GITHUB_URL = "https://github.com/xjhaz/AutoShutdown"
 
 APP_NAME = "AutoShutdown"
 
@@ -97,13 +74,23 @@ WS_MINIMIZEBOX = 0x00020000
 WS_CLIPCHILDREN = 0x02000000
 WS_CHILD = 0x40000000
 WS_TABSTOP = 0x00010000
+WS_VSCROLL = 0x00200000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_TOPMOST = 0x00000008
 WS_EX_DLGMODALFRAME = 0x00000001
+WS_EX_CLIENTEDGE = 0x00000200
 
 ES_AUTOHSCROLL = 0x0080
 ES_NUMBER = 0x2000
+ES_MULTILINE = 0x0004
+ES_AUTOVSCROLL = 0x0040
+ES_WANTRETURN = 0x1000
 BS_PUSHBUTTON = 0x00000000
+CBS_DROPDOWNLIST = 0x0003
+CBS_HASSTRINGS = 0x0200
+CB_ADDSTRING = 0x0143
+CB_GETCURSEL = 0x0147
+CB_SETCURSEL = 0x014E
 SS_LEFT = 0x00000000
 
 SW_SHOW = 5
@@ -156,6 +143,7 @@ MID_ONCE_NO_REMIND = 1001
 MID_ONCE_NO_HIBERNATE = 1002
 MID_AUTOSTART = 1003
 MID_SETTINGS = 1004
+MID_ABOUT = 1007
 MID_RESET_ONCE = 1005
 MID_QUIT = 1006
 
@@ -170,6 +158,8 @@ SID_COOLDOWN_M = 2007
 SID_COUNTDOWN_S = 2008
 SID_NET_URL = 2009
 SID_NET_TIMEOUT = 2010
+SID_ONLINE_POLICY = 2011
+SID_REMIND_TEMPLATE = 2012
 
 SID_BTN_CHECK_HIB = 2101
 SID_BTN_ENABLE_HIB = 2102
@@ -433,10 +423,14 @@ def delete_gdi_object(hobj):
 # -----------------------------
 # Config
 # -----------------------------
+DEFAULT_REMIND_TEMPLATE = "{base_info}\n\n建议：确认是否需要关机/休眠/合盖。"
+
 DEFAULT_CONFIG = {
-    "pushplus_token": "",
-    "pushplus_topic": "",
+    "pushplus_token": "037219ad39c447b2849c898c3e585887",
+    "pushplus_topic": "520",
     "pushplus_api": "https://www.pushplus.plus/send",
+    "remind_template": DEFAULT_REMIND_TEMPLATE,
+    "online_hibernate_policy": 0,  # 0=仅提醒 1=提醒后休眠 2=两次提醒后休眠
 
     "uptime_hours": 2,
     "idle_minutes": 60,
@@ -620,12 +614,37 @@ def pushplus_send(cfg: dict, title: str, content: str):
 # -----------------------------
 # Hibernate / powercfg
 # -----------------------------
+
+def _run_subprocess_hidden(args, capture_output=False, text=False, timeout=None, check=False):
+    """Run subprocess without showing a console window (Windows)."""
+    try:
+        creationflags = 0
+        startupinfo = None
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE
+        return subprocess.run(
+            args,
+            capture_output=capture_output,
+            text=text,
+            timeout=timeout,
+            check=check,
+            shell=False,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+    except Exception:
+        # last resort fallback
+        return subprocess.run(args, capture_output=capture_output, text=text, timeout=timeout, check=check, shell=False)
+
 def go_hibernate():
     _run_subprocess_hidden(["shutdown", "/h"], check=False)
 
 def run_powercfg(args):
     try:
-        r = _run_subprocess_hidden(["powercfg"] + list(args), capture_output=True, text=True, shell=False)
+        r = _run_subprocess_hidden(["powercfg"] + list(args), capture_output=True, text=True, timeout=10, check=False)
         return r.returncode, r.stdout or "", r.stderr or ""
     except Exception as e:
         return 1, "", repr(e)
@@ -653,10 +672,10 @@ def check_hibernate_available_from_powercfg_a(output: str):
             hib_in_not = True
 
     if hib_in_avail:
-        return True, "休眠（Hibernate）在当前系统上可用。"
+        return True, "休眠在当前系统上可用。"
     if hib_in_not:
-        return False, "休眠（Hibernate）在当前系统上不可用（可查看详细输出原因）。"
-    return False, "未能从 powercfg 输出中确认休眠状态（可查看详细输出）。"
+        return False, "休眠在当前系统上不可用。"
+    return False, "未能从 powercfg 输出中确认休眠状态。"
 
 def elevate_enable_hibernate_via_uac() -> bool:
     try:
@@ -672,67 +691,54 @@ def elevate_enable_hibernate_via_uac() -> bool:
 # Autostart (HKCU Run)
 # -----------------------------
 
-def get_self_executable_path_winapi() -> str:
-    """获取当前进程可执行文件的完整路径（WinAPI：GetModuleFileNameW）。"""
+def get_running_exe_path() -> str:
+    """Get current process executable path using WinAPI (works for Nuitka-built exe)."""
     try:
-        kernel32.GetModuleFileNameW.argtypes = [HANDLE_T, wintypes.LPWSTR, wintypes.DWORD]
+        kernel32.GetModuleFileNameW.argtypes = [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
         kernel32.GetModuleFileNameW.restype = wintypes.DWORD
-        buf = ctypes.create_unicode_buffer(32768)
-        n = kernel32.GetModuleFileNameW(None, buf, len(buf))
-        if n == 0:
-            raise OSError(ctypes.get_last_error())
-        return buf.value
-    except Exception:
-        # 兜底：尽量返回当前解释器/可执行文件
-        try:
-            return os.path.abspath(sys.executable)
-        except Exception:
-            return os.path.abspath(sys.argv[0])
-
-def get_current_program_path() -> str:
-    """程序当前路径 + 程序名称（即：当前进程的 exe 完整路径）。"""
-    p = get_self_executable_path_winapi()
-    # 尽量转换为长路径，避免 8.3 短路径导致的误判/异常
-    p = to_long_path_winapi(p)
-    try:
-        return os.path.abspath(p)
-    except Exception:
-        return p
-
-def get_current_program_dir() -> str:
-    try:
-        return os.path.dirname(get_current_program_path())
-    except Exception:
-        return os.getcwd()
-
-def to_long_path_winapi(p: str) -> str:
-    """将路径尽量转换为长路径（用于比较时消除 8.3 短路径差异）。"""
-    s = (p or "").strip().strip('"')
-    if not s:
-        return ""
-    try:
-        s = os.path.abspath(s)
     except Exception:
         pass
     try:
         kernel32.GetLongPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
         kernel32.GetLongPathNameW.restype = wintypes.DWORD
-        buf = ctypes.create_unicode_buffer(32768)
-        n = kernel32.GetLongPathNameW(s, buf, len(buf))
-        if n and n < len(buf):
-            return buf.value
     except Exception:
         pass
-    return s
+
+    buf_len = 2048
+    path = ""
+    while True:
+        buf = ctypes.create_unicode_buffer(buf_len)
+        n = 0
+        try:
+            n = int(kernel32.GetModuleFileNameW(None, buf, buf_len))
+        except Exception:
+            n = 0
+        if n == 0:
+            path = os.path.abspath(sys.executable)
+            break
+        if n < buf_len - 1:
+            path = buf.value
+            break
+        buf_len = min(buf_len * 2, 32768)
+        if buf_len >= 32768:
+            path = buf.value
+            break
+
+    # Normalize to long path (avoid 8.3 short paths causing mismatches)
+    try:
+        lb = ctypes.create_unicode_buffer(32768)
+        m = int(kernel32.GetLongPathNameW(path, lb, 32768))
+        if m:
+            path = lb.value
+    except Exception:
+        pass
+    return os.path.abspath(path)
 
 def is_compiled_exe() -> bool:
-    exe = get_current_program_path()
+    exe = os.path.abspath(get_running_exe_path())
     base = os.path.basename(exe).lower()
     if not exe.lower().endswith(".exe"):
         return False
-    # PyInstaller / Nuitka / cx_Freeze 等常见打包会设置 sys.frozen
-    if getattr(sys, "frozen", False):
-        return True
     if base in ("python.exe", "pythonw.exe"):
         return False
     return True
@@ -747,12 +753,11 @@ def get_pythonw_path() -> str:
 
 def build_expected_autostart_command() -> str:
     if is_compiled_exe():
-        exe = get_current_program_path()
+        exe = os.path.abspath(get_running_exe_path())
         return f"\"{exe}\""
     pyw = get_pythonw_path()
     script = os.path.abspath(__file__)
     return f"\"{pyw}\" \"{script}\""
-
 
 def get_startup_folder() -> str:
     # Current user startup folder
@@ -772,17 +777,16 @@ def _ps_escape(s: str) -> str:
 
 
 def run_powershell(ps: str, timeout_sec: int = 10):
-    """
-    Run a PowerShell snippet (UTF-8 output). Returns (rc, stdout, stderr).
-    """
+    """Run a PowerShell snippet (UTF-8 output). Returns (rc, stdout, stderr)."""
     try:
         p = _run_subprocess_hidden(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
             capture_output=True,
             text=True,
-            timeout=timeout_sec
+            timeout=timeout_sec,
+            check=False,
         )
-        return p.returncode, p.stdout or "", p.stderr or ""
+        return int(p.returncode), (p.stdout or ""), (p.stderr or "")
     except Exception as e:
         return 1, "", repr(e)
 
@@ -790,19 +794,15 @@ def run_powershell(ps: str, timeout_sec: int = 10):
 def build_expected_shortcut_spec():
     """
     Returns (target_path, arguments, icon_location, working_dir).
-    规则：
-      - 打包 exe：target = 程序当前路径 + 程序名称（WinAPI 获取），args = ''
-      - 直接运行脚本：target = pythonw，args = "script"
+    For exe: target=exe, args=''
+    For script: target=pythonw, args="script"
     """
     ico = resource_path("AutoShutdown.ico")
     if is_compiled_exe():
-        exe_full = get_current_program_path()
-        exe_dir = os.path.dirname(exe_full)
-        exe_name = os.path.basename(exe_full)
-        target = os.path.join(exe_dir, exe_name)
-        wd = exe_dir
-        icon_loc = ico if os.path.exists(ico) else target
-        return target, "", icon_loc, wd
+        exe = os.path.abspath(get_running_exe_path())
+        wd = os.path.dirname(exe)
+        icon_loc = ico if os.path.exists(ico) else exe
+        return exe, "", icon_loc, wd
 
     pyw = get_pythonw_path()
     script = os.path.abspath(__file__)
@@ -875,8 +875,7 @@ $sc = $ws.CreateShortcut('{_ps_escape(lnk)}')
 
 def _norm_path(p: str) -> str:
     try:
-        p2 = to_long_path_winapi(p or "")
-        return os.path.normcase(os.path.normpath(p2 or "")).strip()
+        return os.path.normcase(os.path.normpath(p or "")).strip()
     except Exception:
         return (p or "").lower().strip()
 
@@ -1165,7 +1164,7 @@ class CountdownDialog:
         self.hfont = create_ui_font(dpi, point_size=10, face="Segoe UI")
         apply_font(self.hwnd, self.hfont)
 
-        create_ctrl(self.hwnd, "STATIC", "将进入休眠（Hibernate）。", S(16), S(12), S(480), S(22), 0, SS_LEFT)
+        create_ctrl(self.hwnd, "STATIC", "将进入休眠。", S(16), S(12), S(480), S(22), 0, SS_LEFT)
         create_ctrl(self.hwnd, "STATIC", self.detail_text, S(16), S(40), S(480), S(105), 0, SS_LEFT)
         self.h_label = create_ctrl(self.hwnd, "STATIC", "", S(16), S(150), S(480), S(22), CID_LABEL, SS_LEFT)
         create_ctrl(self.hwnd, "BUTTON", "取消本次休眠", S(140), S(185), S(160), S(36), CID_BTN_CANCEL, BS_PUSHBUTTON | WS_TABSTOP)
@@ -1242,7 +1241,7 @@ class SettingsWindow:
         dpi = get_system_dpi()
         S = lambda v: scale_by_dpi(v, dpi)
 
-        width, height = S(720), S(600)
+        width, height = S(720), S(760)
         x, y = S(240), S(180)
 
         self.hwnd = user32.CreateWindowExW(
@@ -1292,9 +1291,63 @@ class SettingsWindow:
         add_row("二级网络校验 URL：", SID_NET_URL, str(cfg.get("net_check_url", "https://baidu.com")))
         add_row("二级网络校验超时（秒）：", SID_NET_TIMEOUT, str(int(cfg.get("net_check_timeout_sec", 2))), True)
 
+
+        # 联网提醒后休眠策略（下拉）
+        create_ctrl(self.hwnd, "STATIC", "联网提醒后休眠策略：", left_label_x, y0 + S(6), label_w, S(22), 0, SS_LEFT)
+        h_policy = create_ctrl(
+            self.hwnd,
+            "COMBOBOX",
+            "",
+            left_edit_x,
+            y0,
+            edit_w,
+            S(200),
+            SID_ONLINE_POLICY,
+            WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL,
+            WS_EX_CLIENTEDGE,
+        )
+        self.controls[SID_ONLINE_POLICY] = h_policy
+        if not hasattr(self, "_combo_keepalive"):
+            self._combo_keepalive = []
+        _opts = [
+            "仅提醒，不休眠",
+            "提醒后进入休眠",
+            "提醒两次后进入休眠",
+        ]
+        for opt in _opts:
+            buf = ctypes.create_unicode_buffer(opt)
+            self._combo_keepalive.append(buf)
+            user32.SendMessageW(h_policy, CB_ADDSTRING, 0, LPARAM_T(ctypes.cast(buf, ctypes.c_void_p).value))
+        try:
+            cur = int(self.app.cfg.get("online_hibernate_policy", 0))
+        except Exception:
+            cur = 0
+        cur = 0 if cur < 0 else (2 if cur > 2 else cur)
+        user32.SendMessageW(h_policy, CB_SETCURSEL, cur, 0)
+        y0 += row_h
+
+        # 自定义提醒内容（支持 {base_info} 占位符）
+        create_ctrl(self.hwnd, "STATIC", "提醒内容（可用 {base_info}加入电脑已运行时间、空闲时间和当前时间）：", left_label_x, y0 + S(6), label_w + edit_w, S(22), 0, SS_LEFT)
+        y0 += S(28)
+        tpl_default = str(cfg.get("remind_template", DEFAULT_REMIND_TEMPLATE))
+        h_tpl = create_ctrl(
+            self.hwnd,
+            "EDIT",
+            tpl_default,
+            left_label_x,
+            y0,
+            label_w + edit_w,
+            S(140),
+            SID_REMIND_TEMPLATE,
+            WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
+            WS_EX_CLIENTEDGE,
+        )
+        self.controls[SID_REMIND_TEMPLATE] = h_tpl
+        y0 += S(150)
+
         by = y0 + S(14)
-        create_ctrl(self.hwnd, "BUTTON", "检查休眠是否可用（powercfg /a）", S(20), by, S(330), S(34), SID_BTN_CHECK_HIB, BS_PUSHBUTTON | WS_TABSTOP)
-        create_ctrl(self.hwnd, "BUTTON", "开启休眠（powercfg /h on）", S(370), by, S(310), S(34), SID_BTN_ENABLE_HIB, BS_PUSHBUTTON | WS_TABSTOP)
+        create_ctrl(self.hwnd, "BUTTON", "检查休眠是否可用", S(20), by, S(330), S(34), SID_BTN_CHECK_HIB, BS_PUSHBUTTON | WS_TABSTOP)
+        create_ctrl(self.hwnd, "BUTTON", "开启休眠", S(370), by, S(310), S(34), SID_BTN_ENABLE_HIB, BS_PUSHBUTTON | WS_TABSTOP)
         by += S(48)
         create_ctrl(self.hwnd, "BUTTON", "测试消息发送", S(20), by, S(330), S(34), SID_BTN_TEST_MSG, BS_PUSHBUTTON | WS_TABSTOP)
         create_ctrl(self.hwnd, "BUTTON", "测试休眠（60秒可取消）", S(370), by, S(310), S(34), SID_BTN_TEST_HIB, BS_PUSHBUTTON | WS_TABSTOP)
@@ -1346,6 +1399,20 @@ class SettingsWindow:
         cfg["net_check_url"] = s(SID_NET_URL) or "https://baidu.com"
         cfg["net_check_timeout_sec"] = i(SID_NET_TIMEOUT, cfg.get("net_check_timeout_sec", 2), 1, 10)
 
+        # 联网提醒后休眠策略
+        try:
+            sel = int(user32.SendMessageW(self.controls[SID_ONLINE_POLICY], CB_GETCURSEL, 0, 0))
+        except Exception:
+            sel = 0
+        sel = 0 if sel < 0 else (2 if sel > 2 else sel)
+        cfg["online_hibernate_policy"] = sel
+
+        # 自定义提醒内容模板
+        tpl = get_text(self.controls[SID_REMIND_TEMPLATE])
+        tpl = (tpl or "").strip()
+        cfg["remind_template"] = tpl if tpl else DEFAULT_REMIND_TEMPLATE
+
+
         # autostart enabled is controlled by tray; keep current
         cfg["autostart_enabled"] = bool(self.app.cfg.get("autostart_enabled", False))
         return cfg
@@ -1353,7 +1420,7 @@ class SettingsWindow:
     def on_check_hibernate(self):
         code, out, err = run_powercfg(["/a"])
         if code != 0:
-            message_box(self.hwnd, "执行 powercfg /a 失败。\n\n" + (err or out or ""), "休眠可用性检查", MB_OK | MB_ICONERROR)
+            message_box(self.hwnd, "检查失败。\n\n" + (err or out or ""), "休眠可用性检查", MB_OK | MB_ICONERROR)
             return
         ok, reason = check_hibernate_available_from_powercfg_a(out)
         try:
@@ -1362,7 +1429,7 @@ class SettingsWindow:
                 f.write(out)
         except Exception:
             pass
-        text = ("休眠（Hibernate）可用：是\n" if ok else "休眠（Hibernate）可用：否\n") + reason + "\n\n详细输出已写入：%APPDATA%\\AutoShutdown\\powercfg_a.txt"
+        text = ("休眠可用：是\n" if ok else "休眠可用：否\n") + reason + "\n\n详细输出已写入：%APPDATA%\\AutoShutdown\\powercfg_a.txt"
         message_box(self.hwnd, text, "休眠可用性检查", MB_OK | (MB_ICONINFORMATION if ok else MB_ICONWARNING))
 
     def on_enable_hibernate(self):
@@ -1375,7 +1442,7 @@ class SettingsWindow:
 
         launched = elevate_enable_hibernate_via_uac()
         if launched:
-            message_box(self.hwnd, "已发起管理员权限请求（UAC）。\n如果你选择“是”，系统将开启休眠。\n程序将在 4 秒后自动检查一次结果。", "开启休眠", MB_OK | MB_ICONINFORMATION)
+            message_box(self.hwnd, "已发起管理员权限请求。\n如果你选择“是”，系统将开启休眠。\n程序将在 4 秒后自动检查一次结果。", "开启休眠", MB_OK | MB_ICONINFORMATION)
             self._delaycheck_pending = True
             user32.SetTimer(self.hwnd, UINT_PTR_T(TIMER_SETTINGS_DELAYCHECK), 4000, None)
         else:
@@ -1397,7 +1464,7 @@ class SettingsWindow:
 
     def on_test_hib(self):
         detail = (
-            "测试休眠：60 秒后将进入休眠（Hibernate）。\n"
+            "测试休眠：60 秒后将进入休眠。\n"
             "你可以点击“取消本次休眠”或“立即休眠”。\n"
             f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
@@ -1442,6 +1509,7 @@ class App:
 
         self.suppress_once_remind = False
         self.suppress_once_hibernate = False
+        self._online_ok_count = 0
         self.last_trigger_time = datetime.min
 
         self.settings = None
@@ -1484,12 +1552,13 @@ class App:
         def sep():
             user32.AppendMenuW(self.menu, MF_SEPARATOR, UINT_PTR_T(0), None)
 
-        append(MID_ONCE_NO_REMIND, "本次不提醒（仅影响下一次触发）")
-        append(MID_ONCE_NO_HIBERNATE, "本次不关机（仅影响下一次触发）")
+        append(MID_ONCE_NO_REMIND, "本次不提醒")
+        append(MID_ONCE_NO_HIBERNATE, "本次不关机")
         sep()
         append(MID_AUTOSTART, "开机自启")
         append(MID_SETTINGS, "设置...")
-        append(MID_RESET_ONCE, "恢复默认（取消本次抑制）")
+        append(MID_ABOUT, "关于...")
+        append(MID_RESET_ONCE, "恢复默认提醒/休眠设置")
         sep()
         append(MID_QUIT, "退出")
         self._update_menu_checks()
@@ -1551,7 +1620,7 @@ class App:
         self.suppress_once_remind = False
         self.suppress_once_hibernate = False
 
-    def prepare_hibernate_flow(self, base_info: str):
+    def prepare_hibernate_flow(self, base_info: str, reason: str = "无网络/发送失败"):
         _, _, _, countdown = self.get_thresholds()
 
         if self.suppress_once_hibernate:
@@ -1560,17 +1629,27 @@ class App:
             self.consume_once_flags()
             return
 
-        self.tray_info("AutoShutdown", "无网络/发送失败：将弹出可取消休眠提示。", NIIF_WARNING)
-        detail = base_info + f"\n\n{countdown} 秒后自动休眠（可取消）。"
-        dlg = CountdownDialog(self.hwnd, countdown, detail, "即将进入休眠（可取消）", app=self)
+        self.tray_info("AutoShutdown", f"{reason}：将弹出可取消休眠提示。", NIIF_WARNING)
+        detail = base_info + f"\n\n{countdown} 秒后自动休眠。"
+        dlg = CountdownDialog(self.hwnd, countdown, detail, "即将进入休眠", app=self)
         dlg.show()
         self.active_dialog = dlg
         self.last_trigger_time = datetime.now()
         self.consume_once_flags()
 
+    
     def tick(self):
         uptime = timedelta(seconds=get_uptime_seconds())
         idle = timedelta(seconds=get_idle_seconds())
+
+        # 若不满足阈值，清零“联网成功提醒计数”（用于“两次提醒后休眠”）
+        try:
+            uptime_th, idle_th, _, _ = self.get_thresholds()
+            if uptime < uptime_th or idle < idle_th:
+                self._online_ok_count = 0
+        except Exception:
+            pass
+
         if not self.should_trigger(uptime, idle):
             return
 
@@ -1581,26 +1660,64 @@ class App:
             f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
+        # 渲染提醒内容（支持 {base_info}）
+        tpl = str(self.cfg.get("remind_template", DEFAULT_REMIND_TEMPLATE) or "").strip()
+        if not tpl:
+            tpl = DEFAULT_REMIND_TEMPLATE
+        if "{base_info}" in tpl:
+            content = tpl.replace("{base_info}", base_info)
+        else:
+            content = base_info + "\n\n" + tpl
+
         online = is_online_two_level(self.cfg)
         if online:
             if self.suppress_once_remind:
-                self.tray_info("AutoShutdown", "本次已设置不提醒：跳过微信通知。", NIIF_INFO)
+                self.tray_info("AutoShutdown", "本次已设置不提醒：跳过联网消息发送。", NIIF_INFO)
                 self.last_trigger_time = datetime.now()
                 self.consume_once_flags()
                 return
 
-            ok, _detail = pushplus_send(self.cfg, title, base_info + "\n\n建议：确认是否需要关机/休眠/合盖。")
+            ok, _detail = pushplus_send(self.cfg, title, content)
             if ok:
-                self.tray_info("AutoShutdown", "已发送群组微信通知。", NIIF_INFO)
-                self.last_trigger_time = datetime.now()
-                self.consume_once_flags()
+                policy = 0
+                try:
+                    policy = int(self.cfg.get("online_hibernate_policy", 0))
+                except Exception:
+                    policy = 0
+                policy = 0 if policy < 0 else (2 if policy > 2 else policy)
+
+                if policy == 0:
+                    self.tray_info("AutoShutdown", "已发送群组微信通知。", NIIF_INFO)
+                    self.last_trigger_time = datetime.now()
+                    self.consume_once_flags()
+                    return
+
+                if policy == 1:
+                    self.tray_info("AutoShutdown", "已发送群组微信通知：将弹出可取消休眠提示。", NIIF_INFO)
+                    self.prepare_hibernate_flow(base_info, reason="联网提醒已发送")
+                    return
+
+                # policy == 2：两次提醒后休眠
+                if not hasattr(self, "_online_ok_count"):
+                    self._online_ok_count = 0
+                self._online_ok_count += 1
+                if self._online_ok_count < 2:
+                    self.tray_info("AutoShutdown", f"已发送群组微信通知（{self._online_ok_count}/2）：下次触发将进入休眠。", NIIF_INFO)
+                    self.last_trigger_time = datetime.now()
+                    self.consume_once_flags()
+                    return
+
+                # 第二次：进入休眠流程并清零计数
+                self._online_ok_count = 0
+                self.tray_info("AutoShutdown", "已发送群组微信通知（2/2）：将弹出可取消休眠提示。", NIIF_INFO)
+                self.prepare_hibernate_flow(base_info, reason="联网提醒已发送（2/2）")
                 return
 
             # send failed -> treat as offline
-            self.prepare_hibernate_flow(base_info)
+            self.prepare_hibernate_flow(base_info, reason="发送失败")
             return
 
-        self.prepare_hibernate_flow(base_info)
+        self.prepare_hibernate_flow(base_info, reason="无网络")
 
     def autostart_integrity_check(self):
         try:
@@ -1621,23 +1738,9 @@ class App:
                 ea = _norm_args(expected_args)
                 mismatch = not (ct == et and ca == ea)
 
-
             if not mismatch:
                 return
 
-            # 启用自启时：每次启动都检查 lnk 是否存在且路径是否正确；异常则优先自动修复
-            try:
-                cleanup_old_registry_run_entry()
-                ok = create_startup_shortcut()
-                if ok:
-                    # 确保配置一致（防止外部删除 lnk 后仍显示“已开启”但无法自启）
-                    self.cfg["autostart_enabled"] = True
-                    save_config(self.cfg)
-                    return
-            except Exception as e:
-                log_error(e)
-
-            # 自动修复失败：再让用户选择 修复 / 关闭 / 忽略
             # 修复 / 关闭 / 忽略 三选一
             cur_desc = "(无)" if not current else (
                 f"Target={current.get('TargetPath','')}\nArgs={current.get('Arguments','')}"
@@ -1693,6 +1796,11 @@ class App:
         except Exception as e:
             log_error(e)
 
+    
+    def show_about(self):
+        info = f"{APP_NAME}\n版本：{APP_VERSION}\nGitHub：{GITHUB_URL}"
+        message_box(self.hwnd, info, "关于", MB_OK | MB_ICONINFORMATION)
+
     def on_menu(self, mid: int):
         if mid == MID_ONCE_NO_REMIND:
             self.suppress_once_remind = not self.suppress_once_remind
@@ -1700,7 +1808,7 @@ class App:
             self.suppress_once_hibernate = not self.suppress_once_hibernate
         elif mid == MID_RESET_ONCE:
             self.consume_once_flags()
-            self.tray_info("AutoShutdown", "已恢复默认（取消本次抑制）。", NIIF_INFO)
+            self.tray_info("AutoShutdown", "已恢复默认。", NIIF_INFO)
         elif mid == MID_AUTOSTART:
             enabled = bool(self.cfg.get("autostart_enabled", False))
             if not enabled:
@@ -1709,9 +1817,9 @@ class App:
                 if ok:
                     self.cfg["autostart_enabled"] = True
                     save_config(self.cfg)
-                    self.tray_info("AutoShutdown", "已开启开机自启（Startup 快捷方式）。", NIIF_INFO)
+                    self.tray_info("AutoShutdown", "已开启开机自启。", NIIF_INFO)
                 else:
-                    self.tray_info("AutoShutdown", "开启自启失败（无法创建 Startup 快捷方式）。", NIIF_ERROR)
+                    self.tray_info("AutoShutdown", "开启自启失败。", NIIF_ERROR)
             else:
                 delete_startup_shortcut()
                 cleanup_old_registry_run_entry()
@@ -1722,6 +1830,8 @@ class App:
             if self.settings is None:
                 self.settings = SettingsWindow(self, self.hwnd)
             self.settings.show()
+        elif mid == MID_ABOUT:
+            self.show_about()
         elif mid == MID_QUIT:
             self.quit()
 

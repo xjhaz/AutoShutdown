@@ -209,7 +209,6 @@ python -m nuitka `
   --windows-icon-from-ico=AutoShutdown.ico `
   --include-data-file=AutoShutdown.ico=AutoShutdown.ico `
   --include-module=app `
-  --include-module=auto_shutdown `
   --include-module=constants `
   --include-module=core `
   --include-module=ui `

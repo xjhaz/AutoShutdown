@@ -25,13 +25,12 @@
 
 ---
 
-### 2️⃣ 触发条件与冷却机制
+### 2️⃣ 触发条件
 
 触发需 **同时满足**：
 
 - 开机运行时间 ≥ `uptime_hours`
 - 用户空闲时间 ≥ `idle_minutes`
-- 距离上次触发 ≥ `cooldown_minutes`（防刷屏 / 防反复休眠）
 
 ---
 
@@ -46,13 +45,13 @@
 
 ### 4️⃣ 联网状态下的行为（可配置）
 
-当检测到联网且消息发送成功时，支持三种策略：
+当检测到联网且消息发送成功时，支持按“提醒次数后休眠”配置：
 
-| 策略           | 行为                        |
-| -------------- | --------------------------- |
-| 仅提醒         | 发送群组微信通知，不休眠    |
-| 提醒后休眠     | 发送通知后弹出休眠倒计时    |
-| 两次提醒后休眠 | 第 2 次触发时才进入休眠流程 |
+| 配置值 | 行为                                   |
+| ------ | -------------------------------------- |
+| 0      | 仅提醒：发送群组微信通知，不休眠       |
+| 1      | 提醒后休眠：发送通知后弹出休眠倒计时   |
+| N>1    | 提醒 N 次后休眠：第 N 次触发进入休眠流程 |
 
 ---
 
@@ -80,11 +79,9 @@
 - pushplus Token / Topic / API
 - 开机运行时长阈值（小时）
 - 空闲时间阈值（分钟）
-- 检查周期（秒）
-- 冷却时间（分钟）
 - 休眠倒计时（秒）
 - 二级网络校验 URL / 超时
-- **联网提醒后休眠策略**
+- **联网提醒后休眠次数（0=仅提醒）**
 - **自定义提醒内容模板**（支持 `{base_info}`）
 
 附带功能：
@@ -115,7 +112,7 @@
 
 ---
 
-### 8️⃣ 开机自启（稳健实现）
+### 8️⃣ 开机自启
 
 - 使用 **Startup 目录 .lnk 快捷方式**
 - **WinAPI 获取当前运行 EXE 路径**（避免 8.3 短路径问题）
@@ -151,6 +148,13 @@
 
 ---
 
+### 10️⃣ 托盘气泡通知
+- 托盘右键菜单可切换“托盘气泡通知”（默认关闭）
+- 开启后在关键节点弹出系统气泡，如联网提醒成功/失败、进入可取消休眠提示等
+- 也可通过配置项 `tray_balloon_enabled` 控制
+
+---
+
 ## 快速开始
 
 ### 方式一：直接运行（Release）
@@ -182,14 +186,13 @@
   "pushplus_topic": "",
   "pushplus_api": "https://www.pushplus.plus/send",
   "remind_template": "{base_info}\n\n建议：确认是否需要关机或休眠。",
-  "online_hibernate_policy": 0,
+  "online_remind_times": 0,
   "uptime_hours": 2,
   "idle_minutes": 60,
-  "check_interval_sec": 120,
-  "cooldown_minutes": 60,
   "pre_hibernate_countdown_sec": 60,
   "net_check_url": "https://baidu.com",
   "net_check_timeout_sec": 2,
+  "tray_balloon_enabled": false,
   "autostart_enabled": false
 }
 ```
@@ -199,12 +202,19 @@
 ## 打包指南（Nuitka，推荐）
 
 ```powershell
-python -m nuitka .\auto_shutdown_win32_native.py `
+python -m nuitka `
   --standalone `
-  --windows-console-mode=disable `
+  --follow-imports `
+  --windows-disable-console `
   --windows-icon-from-ico=AutoShutdown.ico `
-  --include-data-files=AutoShutdown.ico=AutoShutdown.ico `
-  --output-dir=diststand
+  --include-data-file=AutoShutdown.ico=AutoShutdown.ico `
+  --include-module=app `
+  --include-module=auto_shutdown `
+  --include-module=constants `
+  --include-module=core `
+  --include-module=ui `
+  --include-module=winapi `
+  auto_shutdown_win32_native.py
 ```
 
 - 不弹控制台黑窗
@@ -215,7 +225,7 @@ python -m nuitka .\auto_shutdown_win32_native.py `
 ## 项目信息
 
 - 项目名称：AutoShutdown
-- 当前版本：0.0.2
+- 当前版本：0.0.4
 - GitHub： https://github.com/xjhaz/AutoShutdown
 
 ---

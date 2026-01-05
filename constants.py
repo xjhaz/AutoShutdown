@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 APP_NAME = "AutoShutdown"
-APP_VERSION = "0.0.4"
+APP_VERSION = "0.0.5"
 GITHUB_URL = "https://github.com/xjhaz/AutoShutdown"
 
 # Startup folder shortcut (no admin, robust)

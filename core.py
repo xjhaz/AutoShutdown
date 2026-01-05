@@ -193,6 +193,11 @@ kernel32.GetTickCount64.argtypes = []
 kernel32.GetTickCount64.restype = ctypes.c_ulonglong
 kernel32.GetTickCount.argtypes = []
 kernel32.GetTickCount.restype = wintypes.DWORD
+try:
+    kernel32.QueryUnbiasedInterruptTime.argtypes = [ctypes.POINTER(ctypes.c_ulonglong)]
+    kernel32.QueryUnbiasedInterruptTime.restype = wintypes.BOOL
+except Exception:
+    pass
 
 def get_idle_seconds() -> int:
     lii = LASTINPUTINFO()
@@ -206,6 +211,13 @@ def get_idle_seconds() -> int:
     return idle_ms // 1000
 
 def get_uptime_seconds() -> int:
+    # Prefer uptime that excludes sleep/hibernate time if available.
+    try:
+        t = ctypes.c_ulonglong(0)
+        if kernel32.QueryUnbiasedInterruptTime(ctypes.byref(t)):
+            return int(t.value // 10_000_000)
+    except Exception:
+        pass
     return int(kernel32.GetTickCount64() // 1000)
 
 # -----------------------------

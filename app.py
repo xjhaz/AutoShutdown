@@ -57,11 +57,14 @@ from core import (
     resource_path,
     load_config,
     save_config,
-    DEFAULT_REMIND_TEMPLATE,
+    get_remind_template,
     get_idle_seconds,
     get_uptime_seconds,
     is_online_two_level,
     pushplus_send,
+    get_pushplus_channel_name,
+    get_timeout_action_meta,
+    normalize_timeout_action,
     build_expected_shortcut_spec,
     read_startup_shortcut_spec,
     create_startup_shortcut,
@@ -153,13 +156,13 @@ class App:
             user32.AppendMenuW(self.menu, MF_SEPARATOR, UINT_PTR_T(0), None)
 
         append(MID_ONCE_NO_REMIND, "本次不提醒")
-        append(MID_ONCE_NO_HIBERNATE, "本次不关机")
+        append(MID_ONCE_NO_HIBERNATE, "本次不执行超时动作")
         sep()
         append(MID_AUTOSTART, "开机自启")
         append(MID_TRAY_BALLOON, "托盘气泡通知")
         append(MID_SETTINGS, "设置...")
         append(MID_ABOUT, "关于...")
-        append(MID_RESET_ONCE, "恢复默认提醒/休眠设置")
+        append(MID_RESET_ONCE, "恢复默认提醒/超时动作设置")
         sep()
         append(MID_QUIT, "退出")
         self._update_menu_checks()
@@ -306,6 +309,9 @@ class App:
         countdown = int(self.cfg.get("pre_hibernate_countdown_sec", 60))
         return uptime_th, idle_th, countdown
 
+    def get_timeout_action(self) -> str:
+        return normalize_timeout_action(self.cfg.get("timeout_action", "hibernate"))
+
     def should_trigger(self, uptime: timedelta, idle: timedelta) -> bool:
         if datetime.now() < self.resume_grace_until:
             return False
@@ -320,18 +326,19 @@ class App:
         self.suppress_once_remind = False
         self.suppress_once_hibernate = False
 
-    def prepare_hibernate_flow(self, base_info: str, reason: str = "无网络/发送失败"):
+    def prepare_timeout_action_flow(self, base_info: str, reason: str = "无网络/发送失败"):
         _, _, countdown = self.get_thresholds()
+        action_meta = get_timeout_action_meta(self.get_timeout_action())
 
         if self.suppress_once_hibernate:
-            self.tray_info("AutoShutdown", "本次已设置不关机：跳过休眠。", NIIF_INFO)
+            self.tray_info("AutoShutdown", f"本次已设置不执行超时动作：跳过{action_meta['name']}。", NIIF_INFO)
             self.last_trigger_time = datetime.now()
             self.consume_once_flags()
             return
 
-        self.tray_info("AutoShutdown", f"{reason}：将弹出可取消休眠提示。", NIIF_WARNING)
-        detail = base_info + f"\n\n{countdown} 秒后自动休眠。"
-        dlg = CountdownDialog(self.hwnd, countdown, detail, "即将进入休眠", app=self)
+        self.tray_info("AutoShutdown", f"{reason}：将弹出可取消{action_meta['name']}提示。", NIIF_WARNING)
+        detail = base_info + f"\n\n{countdown} {action_meta['countdown_suffix']}"
+        dlg = CountdownDialog(self.hwnd, countdown, detail, action_meta["title"], app=self, action=action_meta["value"])
         dlg.show()
         self.active_dialog = dlg
         self.last_trigger_time = datetime.now()
@@ -341,7 +348,7 @@ class App:
         uptime = timedelta(seconds=get_uptime_seconds())
         idle = timedelta(seconds=get_idle_seconds())
 
-        # 若不满足阈值，清零"联网成功提醒计数"（用于"两次提醒后休眠"）
+        # 若不满足阈值，清零"联网成功提醒计数"（用于"提醒多次后执行超时动作"）
         try:
             uptime_th, idle_th, _ = self.get_thresholds()
         except Exception:
@@ -362,17 +369,15 @@ class App:
         if not self.should_trigger(uptime, idle):
             return
 
-        title = "电脑长时间未关机提醒"
+        title = "电脑长时间空闲提醒"
         base_info = (
             f"电脑已运行：{self._format_td(uptime)}\n"
             f"空闲时间：{int(idle.total_seconds() / 60)} 分钟\n"
             f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
-        # 渲染提醒内容（支持 {base_info}）
-        tpl = str(self.cfg.get("remind_template", DEFAULT_REMIND_TEMPLATE) or "").strip()
-        if not tpl:
-            tpl = DEFAULT_REMIND_TEMPLATE
+        # 按超时动作渲染提醒内容（支持 {base_info}）
+        tpl = get_remind_template(self.cfg, self.get_timeout_action())
         if "{base_info}" in tpl:
             content = tpl.replace("{base_info}", base_info)
         else:
@@ -399,10 +404,12 @@ class App:
                 if time_since_first_remind < idle_th:
                     return
 
+            channel_name = get_pushplus_channel_name(self.cfg.get("pushplus_channel", "app"))
+            action_meta = get_timeout_action_meta(self.get_timeout_action())
             ok, _detail = pushplus_send(self.cfg, title, content)
             if ok:
                 if remind_times <= 0:
-                    self.tray_info("AutoShutdown", "已发送群组微信通知。", NIIF_INFO)
+                    self.tray_info("AutoShutdown", f"已发送 pushplus{channel_name}通知。", NIIF_INFO)
                     self.last_trigger_time = datetime.now()
                     self.consume_once_flags()
                     return
@@ -414,7 +421,7 @@ class App:
                 if next_count < remind_times:
                     self.tray_info(
                         "AutoShutdown",
-                        f"已发送群组微信通知（{next_count}/{remind_times}）：继续满足条件将再次提醒。",
+                        f"已发送 pushplus{channel_name}通知（{next_count}/{remind_times}）：继续满足条件将再次提醒。",
                         NIIF_INFO
                     )
                     self.last_trigger_time = datetime.now()
@@ -424,10 +431,10 @@ class App:
 
                 self.tray_info(
                     "AutoShutdown",
-                    f"已发送群组微信通知（{next_count}/{remind_times}）：将弹出可取消休眠提示。",
+                    f"已发送 pushplus{channel_name}通知（{next_count}/{remind_times}）：将弹出可取消{action_meta['name']}提示。",
                     NIIF_INFO
                 )
-                self.prepare_hibernate_flow(base_info, reason=f"联网提醒已发送（{next_count}/{remind_times}）")
+                self.prepare_timeout_action_flow(base_info, reason=f"联网提醒已发送（{next_count}/{remind_times}）")
                 self.online_remind_count = 0
                 self.last_online_remind_time = None
                 return
@@ -435,12 +442,12 @@ class App:
             # send failed -> treat as offline
             self.online_remind_count = 0
             self.last_online_remind_time = None
-            self.prepare_hibernate_flow(base_info, reason="发送失败")
+            self.prepare_timeout_action_flow(base_info, reason="发送失败")
             return
 
         self.online_remind_count = 0
         self.last_online_remind_time = None
-        self.prepare_hibernate_flow(base_info, reason="无网络")
+        self.prepare_timeout_action_flow(base_info, reason="无网络")
 
     def autostart_integrity_check(self):
         try:

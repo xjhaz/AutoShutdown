@@ -80,18 +80,24 @@ def resource_path(filename: str) -> str:
 # -----------------------------
 # Config
 # -----------------------------
-DEFAULT_REMIND_TEMPLATE = "{base_info}\n\n建议：确认是否需要关机/休眠/合盖。"
+DEFAULT_REMIND_TEMPLATE = "{base_info}\n\n建议：确认是否需要关机、休眠或锁屏。"
+DEFAULT_REMIND_TEMPLATE_HIBERNATE = "{base_info}\n\n建议：确认是否需要关机或休眠。"
+DEFAULT_REMIND_TEMPLATE_LOCK = "{base_info}\n\n建议：确认是否需要先锁屏。"
 
 DEFAULT_CONFIG = {
     "pushplus_token": "",
     "pushplus_topic": "",
     "pushplus_api": "https://www.pushplus.plus/send",
+    "pushplus_channel": "app",
     "remind_template": DEFAULT_REMIND_TEMPLATE,
+    "remind_template_hibernate": DEFAULT_REMIND_TEMPLATE_HIBERNATE,
+    "remind_template_lock": DEFAULT_REMIND_TEMPLATE_LOCK,
     "online_remind_times": 0,  # 0=仅提醒；N=提醒N次后休眠
 
     "uptime_hours": 2,
     "idle_minutes": 60,
     "pre_hibernate_countdown_sec": 60,
+    "timeout_action": "hibernate",
     "resume_grace_sec": 120,
     "tray_balloon_enabled": False,
     "last_hibernate_time": "",
@@ -139,8 +145,17 @@ def load_config() -> dict:
                         pass
                 if "online_hibernate_policy" in cfg:
                     cfg.pop("online_hibernate_policy", None)
+                old_tpl = str(user_cfg.get("remind_template", "") or "").strip()
+                if "remind_template_hibernate" not in user_cfg:
+                    cfg["remind_template_hibernate"] = old_tpl or DEFAULT_REMIND_TEMPLATE_HIBERNATE
+                if "remind_template_lock" not in user_cfg:
+                    cfg["remind_template_lock"] = old_tpl or DEFAULT_REMIND_TEMPLATE_LOCK
     except Exception as e:
         log_error(e)
+    cfg["pushplus_channel"] = normalize_pushplus_channel(cfg.get("pushplus_channel", "app"))
+    cfg["timeout_action"] = normalize_timeout_action(cfg.get("timeout_action", "hibernate"))
+    cfg["remind_template_hibernate"] = str(cfg.get("remind_template_hibernate", "") or "").strip() or DEFAULT_REMIND_TEMPLATE_HIBERNATE
+    cfg["remind_template_lock"] = str(cfg.get("remind_template_lock", "") or "").strip() or DEFAULT_REMIND_TEMPLATE_LOCK
     return cfg
 
 def save_config(cfg: dict):
@@ -262,16 +277,73 @@ def is_online_two_level(cfg: dict) -> bool:
 # -----------------------------
 # Pushplus
 # -----------------------------
+def normalize_pushplus_channel(value) -> str:
+    channel = str(value or "").strip().lower()
+    if channel in ("wechat", "app"):
+        return channel
+    return "app"
+
+
+def get_pushplus_channel_name(value) -> str:
+    return "微信" if normalize_pushplus_channel(value) == "wechat" else "App"
+
+
+def normalize_timeout_action(value) -> str:
+    action = str(value or "").strip().lower()
+    if action in ("lock", "lockscreen", "lock_screen"):
+        return "lock"
+    return "hibernate"
+
+
+def get_timeout_action_meta(value) -> dict:
+    action = normalize_timeout_action(value)
+    if action == "lock":
+        return {
+            "value": "lock",
+            "name": "锁屏",
+            "verb": "锁屏",
+            "title": "即将锁屏",
+            "intro": "将自动锁屏。",
+            "cancel_button": "取消本次锁屏",
+            "now_button": "立即锁屏",
+            "countdown_suffix": "秒后自动锁屏。",
+            "error_title": "锁屏失败",
+            "error_message": "无法自动锁屏，请检查当前系统会话状态。",
+        }
+    return {
+        "value": "hibernate",
+        "name": "休眠",
+        "verb": "休眠",
+        "title": "即将进入休眠",
+        "intro": "将进入休眠。",
+        "cancel_button": "取消本次休眠",
+        "now_button": "立即休眠",
+        "countdown_suffix": "秒后自动休眠。",
+        "error_title": "休眠失败",
+        "error_message": "无法进入休眠状态。\n请检查系统电源设置或尝试手动启用休眠功能。",
+    }
+
+
+def get_remind_template(cfg: dict, action: str) -> str:
+    action = normalize_timeout_action(action)
+    if action == "lock":
+        return str(cfg.get("remind_template_lock", "") or "").strip() or DEFAULT_REMIND_TEMPLATE_LOCK
+    return str(cfg.get("remind_template_hibernate", "") or "").strip() or DEFAULT_REMIND_TEMPLATE_HIBERNATE
+
+
 def pushplus_send(cfg: dict, title: str, content: str):
     api = str(cfg.get("pushplus_api", "https://www.pushplus.plus/send")).strip()
+    topic = str(cfg.get("pushplus_topic", "")).strip()
+    channel = normalize_pushplus_channel(cfg.get("pushplus_channel", "app"))
     payload = {
         "token": cfg.get("pushplus_token", ""),
         "title": title,
         "content": content,
-        "topic": cfg.get("pushplus_topic", ""),
         "template": "txt",
-        "channel": "wechat"
+        "channel": channel,
     }
+    if channel == "wechat" and topic:
+        payload["topic"] = topic
     try:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urlrequest.Request(
@@ -347,6 +419,26 @@ def go_hibernate():
     
     # 如果以上方法都失败，则返回False
     return False
+
+
+def go_lock_screen():
+    try:
+        user32.LockWorkStation.argtypes = []
+        user32.LockWorkStation.restype = wintypes.BOOL
+        return bool(user32.LockWorkStation())
+    except Exception:
+        return False
+
+
+def perform_timeout_action(action: str):
+    meta = get_timeout_action_meta(action)
+    if meta["value"] == "lock":
+        ok = go_lock_screen()
+    else:
+        ok = go_hibernate()
+    if ok:
+        return True, ""
+    return False, meta["error_message"]
 
 def run_powercfg(args):
     try:

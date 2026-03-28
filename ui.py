@@ -37,6 +37,12 @@ from constants import (
     ES_AUTOVSCROLL,
     ES_WANTRETURN,
     BS_PUSHBUTTON,
+    CBS_DROPDOWNLIST,
+    CBS_HASSTRINGS,
+    CB_ADDSTRING,
+    CB_GETCURSEL,
+    CB_SETCURSEL,
+    CBN_SELCHANGE,
     SS_LEFT,
     SW_SHOW,
     MB_OK,
@@ -72,10 +78,13 @@ from constants import (
     SID_NET_TIMEOUT,
     SID_ONLINE_POLICY,
     SID_REMIND_TEMPLATE,
+    SID_PUSHPLUS_CHANNEL,
+    SID_TIMEOUT_ACTION,
     SID_BTN_CHECK_HIB,
     SID_BTN_ENABLE_HIB,
     SID_BTN_TEST_MSG,
     SID_BTN_TEST_HIB,
+    SID_BTN_TEST_LOCK,
     SID_BTN_SAVE,
     SID_BTN_CANCEL,
     CID_LABEL,
@@ -106,14 +115,19 @@ from core import (
     ensure_dirs,
     APPDATA_DIR,
     log_error,
-    DEFAULT_REMIND_TEMPLATE,
+    DEFAULT_REMIND_TEMPLATE_HIBERNATE,
+    DEFAULT_REMIND_TEMPLATE_LOCK,
     pushplus_send,
+    get_pushplus_channel_name,
+    normalize_pushplus_channel,
+    normalize_timeout_action,
+    get_timeout_action_meta,
     run_powercfg,
     check_hibernate_available_from_powercfg_a,
     elevate_enable_hibernate_via_uac,
     save_config,
     resource_path,
-    go_hibernate,
+    perform_timeout_action,
 )
 
 # -----------------------------
@@ -332,6 +346,11 @@ def create_ctrl(parent, cls, text, x, y, w, h, cid, style=0, exstyle=0):
         None
     )
 
+
+def combo_add_string(hwnd_ctrl, text: str):
+    buf = ctypes.create_unicode_buffer(_w(text))
+    user32.SendMessageW(hwnd_ctrl, CB_ADDSTRING, WPARAM_T(0), LPARAM_T(ctypes.addressof(buf)))
+
 # -----------------------------
 # Tray icon struct
 # -----------------------------
@@ -417,7 +436,7 @@ def _register_window_class(class_name: str, wndproc):
 class CountdownDialog:
     CLASS_NAME = "AutoShutdown_CountdownDialog"
 
-    def __init__(self, owner_hwnd, seconds: int, detail_text: str, title: str, app=None):
+    def __init__(self, owner_hwnd, seconds: int, detail_text: str, title: str, app=None, action: str = "hibernate"):
         self.owner_hwnd = owner_hwnd
         self.app = app
         self.remaining = max(1, int(seconds))
@@ -425,6 +444,7 @@ class CountdownDialog:
         self.accepted = False
         self.detail_text = detail_text
         self.title = title
+        self.action = normalize_timeout_action(action)
         self.hwnd = None
         self.h_label = None
         self.hfont = None
@@ -452,12 +472,13 @@ class CountdownDialog:
 
         self.hfont = create_ui_font(dpi, point_size=10, face="Segoe UI")
         apply_font(self.hwnd, self.hfont)
+        action_meta = get_timeout_action_meta(self.action)
 
-        create_ctrl(self.hwnd, "STATIC", "将进入休眠。", S(16), S(12), S(480), S(22), 0, SS_LEFT)
+        create_ctrl(self.hwnd, "STATIC", action_meta["intro"], S(16), S(12), S(480), S(22), 0, SS_LEFT)
         create_ctrl(self.hwnd, "STATIC", self.detail_text, S(16), S(40), S(480), S(105), 0, SS_LEFT)
         self.h_label = create_ctrl(self.hwnd, "STATIC", "", S(16), S(150), S(480), S(22), CID_LABEL, SS_LEFT)
-        create_ctrl(self.hwnd, "BUTTON", "取消本次休眠", S(140), S(185), S(160), S(36), CID_BTN_CANCEL, BS_PUSHBUTTON | WS_TABSTOP)
-        create_ctrl(self.hwnd, "BUTTON", "立即休眠", S(320), S(185), S(160), S(36), CID_BTN_NOW, BS_PUSHBUTTON | WS_TABSTOP)
+        create_ctrl(self.hwnd, "BUTTON", action_meta["cancel_button"], S(140), S(185), S(160), S(36), CID_BTN_CANCEL, BS_PUSHBUTTON | WS_TABSTOP)
+        create_ctrl(self.hwnd, "BUTTON", action_meta["now_button"], S(320), S(185), S(160), S(36), CID_BTN_NOW, BS_PUSHBUTTON | WS_TABSTOP)
 
         apply_font_to_all_children(self.hwnd, self.hfont)
 
@@ -514,6 +535,14 @@ class SettingsWindow:
         self.owner_hwnd = owner_hwnd
         self.hwnd = None
         self.controls = {}
+        self.combo_options = {}
+        self.remind_templates = {}
+        self.current_template_action = "hibernate"
+        self.current_pushplus_channel = "app"
+        self.h_topic_label = None
+        self.h_topic_edit = None
+        self.h_template_label = None
+        self.h_template_edit = None
         self.hfont = None
         self._delaycheck_pending = False
 
@@ -530,7 +559,7 @@ class SettingsWindow:
         dpi = get_system_dpi()
         S = lambda v: scale_by_dpi(v, dpi)
 
-        width, height = S(720), S(760)
+        width, height = S(720), S(850)
         x, y = S(240), S(180)
 
         self.hwnd = user32.CreateWindowExW(
@@ -550,11 +579,15 @@ class SettingsWindow:
         apply_font(self.hwnd, self.hfont)
 
         left_label_x = S(20)
-        left_edit_x = S(240)
+        right_margin = S(20)
+        col_gap = S(20)
+        content_w = width - left_label_x - right_margin
+        label_w = max(S(280), int(content_w * 0.38))
+        label_w = min(label_w, S(340))
+        left_edit_x = left_label_x + label_w + col_gap
         y0 = S(20)
         row_h = S(32)
-        edit_w = S(440)
-        label_w = S(210)
+        edit_w = max(S(260), content_w - label_w - col_gap)
 
         def add_row(label, cid, value, is_number=False):
             nonlocal y0
@@ -566,53 +599,108 @@ class SettingsWindow:
             self.controls[cid] = h
             y0 += row_h
 
+        def add_combo_row(label, cid, options, current_value):
+            nonlocal y0
+            create_ctrl(self.hwnd, "STATIC", label, left_label_x, y0 + S(6), label_w, S(22), 0, SS_LEFT)
+            h = create_ctrl(
+                self.hwnd,
+                "COMBOBOX",
+                "",
+                left_edit_x,
+                y0,
+                edit_w,
+                S(220),
+                cid,
+                CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_TABSTOP,
+            )
+            self.controls[cid] = h
+            self.combo_options[cid] = list(options)
+
+            selected = 0
+            for idx, (text, value) in enumerate(options):
+                combo_add_string(h, text)
+                if value == current_value:
+                    selected = idx
+            user32.SendMessageW(h, CB_SETCURSEL, WPARAM_T(selected), LPARAM_T(0))
+            y0 += row_h
+
 
         cfg = self.app.cfg
+        self.remind_templates = {
+            "hibernate": str(cfg.get("remind_template_hibernate", DEFAULT_REMIND_TEMPLATE_HIBERNATE)),
+            "lock": str(cfg.get("remind_template_lock", DEFAULT_REMIND_TEMPLATE_LOCK)),
+        }
         add_row("pushplus token：", SID_TOKEN, str(cfg.get("pushplus_token", "")))
-        add_row("群组 topic：", SID_TOPIC, str(cfg.get("pushplus_topic", "")))
+        self.h_topic_label = create_ctrl(self.hwnd, "STATIC", "", left_label_x, y0 + S(6), label_w, S(22), 0, SS_LEFT)
+        self.h_topic_edit = create_ctrl(self.hwnd, "EDIT", str(cfg.get("pushplus_topic", "")), left_edit_x, y0, edit_w, S(26), SID_TOPIC, ES_AUTOHSCROLL | WS_TABSTOP)
+        self.controls[SID_TOPIC] = self.h_topic_edit
+        y0 += row_h
         add_row("pushplus API：", SID_API, str(cfg.get("pushplus_api", "https://www.pushplus.plus/send")))
+        add_combo_row(
+            "pushplus 通知渠道：",
+            SID_PUSHPLUS_CHANNEL,
+            [("微信渠道", "wechat"), ("App 渠道", "app")],
+            normalize_pushplus_channel(cfg.get("pushplus_channel", "app")),
+        )
 
         y0 += S(10)
         add_row("开机时长阈值（小时）：", SID_UPTIME_H, str(int(cfg.get("uptime_hours", 1))), True)
         add_row("空闲阈值（分钟）：", SID_IDLE_M, str(int(cfg.get("idle_minutes", 1))), True)
-        add_row("休眠倒计时（秒）：", SID_COUNTDOWN_S, str(int(cfg.get("pre_hibernate_countdown_sec", 60))), True)
+        add_row("超时动作倒计时（秒）：", SID_COUNTDOWN_S, str(int(cfg.get("pre_hibernate_countdown_sec", 60))), True)
+        add_combo_row(
+            "超时后执行动作：",
+            SID_TIMEOUT_ACTION,
+            [("休眠", "hibernate"), ("锁屏", "lock")],
+            normalize_timeout_action(cfg.get("timeout_action", "hibernate")),
+        )
         add_row("二级网络校验 URL：", SID_NET_URL, str(cfg.get("net_check_url", "https://baidu.com")))
         add_row("二级网络校验超时（秒）：", SID_NET_TIMEOUT, str(int(cfg.get("net_check_timeout_sec", 2))), True)
-        add_row("联网提醒后休眠次数（0=仅提醒）：", SID_ONLINE_POLICY, str(int(cfg.get("online_remind_times", 0))), True)
+        add_row("联网提醒后执行动作次数（0=仅提醒）：", SID_ONLINE_POLICY, str(int(cfg.get("online_remind_times", 0))), True)
 
         # 自定义提醒内容（支持 {base_info} 占位符）
-        create_ctrl(self.hwnd, "STATIC", "提醒内容（可用 {base_info}加入电脑已运行时间、空闲时间和当前时间）：", left_label_x, y0 + S(6), label_w + edit_w, S(22), 0, SS_LEFT)
+        self.h_template_label = create_ctrl(self.hwnd, "STATIC", "", left_label_x, y0 + S(6), content_w, S(22), 0, SS_LEFT)
         y0 += S(28)
-        tpl_default = str(cfg.get("remind_template", DEFAULT_REMIND_TEMPLATE))
-        h_tpl = create_ctrl(
+        self.h_template_edit = create_ctrl(
             self.hwnd,
             "EDIT",
-            tpl_default,
+            "",
             left_label_x,
             y0,
-            label_w + edit_w,
+            content_w,
             S(140),
             SID_REMIND_TEMPLATE,
             WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
             WS_EX_CLIENTEDGE,
         )
-        self.controls[SID_REMIND_TEMPLATE] = h_tpl
+        self.controls[SID_REMIND_TEMPLATE] = self.h_template_edit
         y0 += S(150)
 
         by = y0 + S(14)
-        create_ctrl(self.hwnd, "BUTTON", "检查休眠是否可用", S(20), by, S(330), S(34), SID_BTN_CHECK_HIB, BS_PUSHBUTTON | WS_TABSTOP)
-        create_ctrl(self.hwnd, "BUTTON", "开启休眠", S(370), by, S(310), S(34), SID_BTN_ENABLE_HIB, BS_PUSHBUTTON | WS_TABSTOP)
+        two_btn_gap = S(20)
+        two_btn_w = (content_w - two_btn_gap) // 2
+        create_ctrl(self.hwnd, "BUTTON", "检查休眠是否可用", left_label_x, by, two_btn_w, S(34), SID_BTN_CHECK_HIB, BS_PUSHBUTTON | WS_TABSTOP)
+        create_ctrl(self.hwnd, "BUTTON", "开启休眠", left_label_x + two_btn_w + two_btn_gap, by, two_btn_w, S(34), SID_BTN_ENABLE_HIB, BS_PUSHBUTTON | WS_TABSTOP)
         by += S(48)
-        create_ctrl(self.hwnd, "BUTTON", "测试消息发送", S(20), by, S(330), S(34), SID_BTN_TEST_MSG, BS_PUSHBUTTON | WS_TABSTOP)
-        create_ctrl(self.hwnd, "BUTTON", "测试休眠（60秒可取消）", S(370), by, S(310), S(34), SID_BTN_TEST_HIB, BS_PUSHBUTTON | WS_TABSTOP)
+        three_btn_gap = S(20)
+        three_btn_w = (content_w - three_btn_gap * 2) // 3
+        create_ctrl(self.hwnd, "BUTTON", "测试消息发送", left_label_x, by, three_btn_w, S(34), SID_BTN_TEST_MSG, BS_PUSHBUTTON | WS_TABSTOP)
+        create_ctrl(self.hwnd, "BUTTON", "测试休眠（60秒可取消）", left_label_x + three_btn_w + three_btn_gap, by, three_btn_w, S(34), SID_BTN_TEST_HIB, BS_PUSHBUTTON | WS_TABSTOP)
+        create_ctrl(self.hwnd, "BUTTON", "测试锁屏（60秒可取消）", left_label_x + (three_btn_w + three_btn_gap) * 2, by, three_btn_w, S(34), SID_BTN_TEST_LOCK, BS_PUSHBUTTON | WS_TABSTOP)
         by += S(64)
-        create_ctrl(self.hwnd, "BUTTON", "保存", S(410), by, S(130), S(36), SID_BTN_SAVE, BS_PUSHBUTTON | WS_TABSTOP)
-        create_ctrl(self.hwnd, "BUTTON", "取消", S(550), by, S(130), S(36), SID_BTN_CANCEL, BS_PUSHBUTTON | WS_TABSTOP)
+        action_btn_gap = S(16)
+        action_btn_w = S(130)
+        action_right = left_label_x + content_w
+        cancel_x = action_right - action_btn_w
+        save_x = cancel_x - action_btn_gap - action_btn_w
+        create_ctrl(self.hwnd, "BUTTON", "保存", save_x, by, action_btn_w, S(36), SID_BTN_SAVE, BS_PUSHBUTTON | WS_TABSTOP)
+        create_ctrl(self.hwnd, "BUTTON", "取消", cancel_x, by, action_btn_w, S(36), SID_BTN_CANCEL, BS_PUSHBUTTON | WS_TABSTOP)
         by += S(52)
         create_ctrl(self.hwnd, "STATIC", "提示：关闭本窗口不会退出程序；请在托盘菜单选择“退出”。",
-                    S(20), by, S(660), S(22), 0, SS_LEFT)
+                    left_label_x, by, content_w, S(22), 0, SS_LEFT)
 
         apply_font_to_all_children(self.hwnd, self.hfont)
+        self.on_pushplus_channel_changed(force=True)
+        self.on_timeout_action_changed(force=True)
 
     def close(self):
         try:
@@ -623,6 +711,51 @@ class SettingsWindow:
         delete_gdi_object(self.hfont)
         self.hfont = None
         self.hwnd = None
+
+    def _get_timeout_action_from_ui(self) -> str:
+        hwnd = self.controls.get(SID_TIMEOUT_ACTION)
+        options = self.combo_options.get(SID_TIMEOUT_ACTION, [])
+        idx = int(user32.SendMessageW(hwnd, CB_GETCURSEL, WPARAM_T(0), LPARAM_T(0)))
+        if 0 <= idx < len(options):
+            return options[idx][1]
+        return "hibernate"
+
+    def _get_pushplus_channel_from_ui(self) -> str:
+        hwnd = self.controls.get(SID_PUSHPLUS_CHANNEL)
+        options = self.combo_options.get(SID_PUSHPLUS_CHANNEL, [])
+        idx = int(user32.SendMessageW(hwnd, CB_GETCURSEL, WPARAM_T(0), LPARAM_T(0)))
+        if 0 <= idx < len(options):
+            return options[idx][1]
+        return "app"
+
+    def on_pushplus_channel_changed(self, force: bool = False):
+        next_channel = normalize_pushplus_channel(self._get_pushplus_channel_from_ui())
+        if not force and next_channel == self.current_pushplus_channel:
+            return
+        self.current_pushplus_channel = next_channel
+        if next_channel == "wechat":
+            set_text(self.h_topic_label, "群组 topic（微信群发可选）：")
+            user32.EnableWindow(self.h_topic_edit, True)
+        else:
+            set_text(self.h_topic_label, "topic（仅微信渠道群发使用）：")
+            user32.EnableWindow(self.h_topic_edit, False)
+
+    def _sync_template_editor(self):
+        if not self.h_template_edit or not self.current_template_action:
+            return
+        self.remind_templates[self.current_template_action] = get_text(self.h_template_edit)
+
+    def on_timeout_action_changed(self, force: bool = False):
+        next_action = normalize_timeout_action(self._get_timeout_action_from_ui())
+        if not force and next_action == self.current_template_action:
+            return
+        if not force:
+            self._sync_template_editor()
+        self.current_template_action = next_action
+        action_meta = get_timeout_action_meta(next_action)
+        label = f"{action_meta['name']}提醒文案（可用 {{base_info}}加入电脑已运行时间、空闲时间和当前时间）："
+        set_text(self.h_template_label, label)
+        set_text(self.h_template_edit, self.remind_templates.get(next_action, ""))
 
     def _get_cfg_from_ui(self) -> dict:
         cfg = dict(self.app.cfg)
@@ -641,22 +774,35 @@ class SettingsWindow:
                 v = min(maxv, v)
             return v
 
+        def combo_value(cid, default):
+            hwnd = self.controls.get(cid)
+            options = self.combo_options.get(cid, [])
+            idx = int(user32.SendMessageW(hwnd, CB_GETCURSEL, WPARAM_T(0), LPARAM_T(0)))
+            if 0 <= idx < len(options):
+                return options[idx][1]
+            return default
+
         cfg["pushplus_token"] = s(SID_TOKEN)
         cfg["pushplus_topic"] = s(SID_TOPIC)
         cfg["pushplus_api"] = s(SID_API) or "https://www.pushplus.plus/send"
+        cfg["pushplus_channel"] = combo_value(SID_PUSHPLUS_CHANNEL, "app")
 
         cfg["uptime_hours"] = i(SID_UPTIME_H, cfg.get("uptime_hours", 2), 0, 168)
         cfg["idle_minutes"] = i(SID_IDLE_M, cfg.get("idle_minutes", 60), 0, 24*60)
         cfg["pre_hibernate_countdown_sec"] = i(SID_COUNTDOWN_S, cfg.get("pre_hibernate_countdown_sec", 60), 1, 3600)
+        cfg["timeout_action"] = combo_value(SID_TIMEOUT_ACTION, "hibernate")
         cfg["net_check_url"] = s(SID_NET_URL) or "https://baidu.com"
         cfg["net_check_timeout_sec"] = i(SID_NET_TIMEOUT, cfg.get("net_check_timeout_sec", 2), 1, 10)
 
         cfg["online_remind_times"] = i(SID_ONLINE_POLICY, cfg.get("online_remind_times", 0), 0, 99)
 
         # 自定义提醒内容模板
-        tpl = get_text(self.controls[SID_REMIND_TEMPLATE])
-        tpl = (tpl or "").strip()
-        cfg["remind_template"] = tpl if tpl else DEFAULT_REMIND_TEMPLATE
+        self._sync_template_editor()
+        tpl_hibernate = (self.remind_templates.get("hibernate", "") or "").strip()
+        tpl_lock = (self.remind_templates.get("lock", "") or "").strip()
+        cfg["remind_template_hibernate"] = tpl_hibernate if tpl_hibernate else DEFAULT_REMIND_TEMPLATE_HIBERNATE
+        cfg["remind_template_lock"] = tpl_lock if tpl_lock else DEFAULT_REMIND_TEMPLATE_LOCK
+        cfg["remind_template"] = cfg["remind_template_hibernate"]
 
 
         # autostart enabled is controlled by tray; keep current
@@ -699,31 +845,39 @@ class SettingsWindow:
         if not cfg.get("pushplus_token"):
             message_box(self.hwnd, "pushplus token 不能为空。", "测试消息发送", MB_OK | MB_ICONWARNING)
             return
-        if not cfg.get("pushplus_topic"):
-            message_box(self.hwnd, "群组 topic 不能为空。", "测试消息发送", MB_OK | MB_ICONWARNING)
-            return
+        channel_name = get_pushplus_channel_name(cfg.get("pushplus_channel", "app"))
         title = "AutoShutdown 测试消息"
-        content = "这是一条测试群组消息。\n时间：%s\ntopic：%s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), cfg.get("pushplus_topic"))
+        content = "这是一条测试消息。\n渠道：%s\n时间：%s" % (
+            channel_name,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        if cfg.get("pushplus_channel") == "wechat" and cfg.get("pushplus_topic"):
+            content += "\ntopic：%s" % cfg.get("pushplus_topic")
         ok, detail = pushplus_send(cfg, title, content)
         message_box(self.hwnd, ("发送成功。\n\n" if ok else "发送失败。\n\n") + (detail or ""), "测试消息发送",
                     MB_OK | (MB_ICONINFORMATION if ok else MB_ICONERROR))
 
-    def on_test_hib(self):
+    def _show_test_action_dialog(self, action: str):
+        action_meta = get_timeout_action_meta(action)
         detail = (
-            "测试休眠：60 秒后将进入休眠。\n"
-            "你可以点击“取消本次休眠”或“立即休眠”。\n"
+            f"测试{action_meta['name']}：60 秒后将自动{action_meta['verb']}。\n"
+            f"你可以点击“{action_meta['cancel_button']}”或“{action_meta['now_button']}”。\n"
             f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        dlg = CountdownDialog(self.hwnd, 60, detail, "测试休眠（60秒可取消）", app=self.app)
+        dlg = CountdownDialog(self.hwnd, 60, detail, f"测试{action_meta['name']}（60秒可取消）", app=self.app, action=action_meta["value"])
         dlg.show()
         self.app.active_dialog = dlg
+
+    def on_test_hib(self):
+        self._show_test_action_dialog("hibernate")
+
+    def on_test_lock(self):
+        self._show_test_action_dialog("lock")
 
     def on_save(self):
         cfg = self._get_cfg_from_ui()
         if not cfg.get("pushplus_token"):
             message_box(self.hwnd, "pushplus token 不能为空。", "提示", MB_OK | MB_ICONWARNING); return
-        if not cfg.get("pushplus_topic"):
-            message_box(self.hwnd, "群组 topic 不能为空。", "提示", MB_OK | MB_ICONWARNING); return
 
         self.app.cfg = cfg
         save_config(cfg)
@@ -789,6 +943,13 @@ def _settings_wndproc(hwnd, msg, wparam, lparam):
     try:
         if msg == WM_COMMAND:
             cid = int(wparam) & 0xFFFF
+            notify = (int(wparam) >> 16) & 0xFFFF
+            if cid == SID_PUSHPLUS_CHANNEL and notify == CBN_SELCHANGE:
+                win.on_pushplus_channel_changed()
+                return 0
+            if cid == SID_TIMEOUT_ACTION and notify == CBN_SELCHANGE:
+                win.on_timeout_action_changed()
+                return 0
             if cid == SID_BTN_CHECK_HIB:
                 win.on_check_hibernate()
             elif cid == SID_BTN_ENABLE_HIB:
@@ -797,6 +958,8 @@ def _settings_wndproc(hwnd, msg, wparam, lparam):
                 win.on_test_msg()
             elif cid == SID_BTN_TEST_HIB:
                 win.on_test_hib()
+            elif cid == SID_BTN_TEST_LOCK:
+                win.on_test_lock()
             elif cid == SID_BTN_SAVE:
                 win.on_save()
             elif cid == SID_BTN_CANCEL:
@@ -848,27 +1011,28 @@ def _countdown_wndproc(hwnd, msg, wparam, lparam):
                     dlg_obj.app.active_dialog = None
                 accepted = bool(dlg_obj and dlg_obj.accepted and (not dlg_obj.cancelled))
                 if accepted:
+                    action_meta = get_timeout_action_meta(getattr(dlg_obj, "action", "hibernate"))
                     marked = None
-                    if dlg_obj and getattr(dlg_obj, "app", None) is not None:
+                    if action_meta["value"] == "hibernate" and dlg_obj and getattr(dlg_obj, "app", None) is not None:
                         try:
                             marked = dlg_obj.app.mark_hibernate_time()
                         except Exception:
                             marked = None
-                    # 修改此处以处理休眠失败的情况
-                    if not go_hibernate():
+                    ok, err_msg = perform_timeout_action(action_meta["value"])
+                    if not ok:
                         if marked and dlg_obj and getattr(dlg_obj, "app", None) is not None:
                             try:
                                 dlg_obj.app.revert_hibernate_time(*marked)
                             except Exception:
                                 pass
-                        # 休眠失败，显示错误信息
                         try:
-                            user32.MessageBoxW(None, 
-                                "无法进入休眠状态。\n请检查系统电源设置或尝试手动启用休眠功能。", 
-                                "休眠失败", 
+                            user32.MessageBoxW(
+                                None,
+                                _w(err_msg or action_meta["error_message"]),
+                                _w(action_meta["error_title"]),
                                 MB_OK | MB_ICONERROR)
                         except:
-                            pass  # 如果无法显示消息框，则静默失败
+                            pass
             except Exception as e:
                 log_error(e)
             return 0
@@ -876,4 +1040,3 @@ def _countdown_wndproc(hwnd, msg, wparam, lparam):
         log_error(e)
 
     return int(user32.DefWindowProcW(hwnd, msg, wparam, lparam))
-    MID_SETTINGS,
